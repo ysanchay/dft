@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -11,6 +12,12 @@ from .tools import TEMP_DIR, cleanup_files, run_job
 from .validators import validate_file
 
 app = FastAPI(title="DFT API", version="0.1.0")
+
+
+def _is_in_temp_dir(path: Path) -> bool:
+    temp_root = TEMP_DIR.resolve()
+    resolved = path.resolve(strict=False)
+    return resolved == temp_root or temp_root in resolved.parents
 
 
 @app.get("/health")
@@ -33,9 +40,10 @@ async def api_upload(file: UploadFile = File(...)) -> dict:
     if not validation.valid:
         raise HTTPException(status_code=400, detail=validation.errors)
 
-    dst = TEMP_DIR / (file.filename or "upload.bin")
+    suffix = Path(file.filename or "upload.bin").suffix
+    dst = TEMP_DIR / f"{uuid4().hex}{suffix}"
     dst.write_bytes(content)
-    return {"stored_path": str(dst), "size_mb": validation.size_mb}
+    return {"stored_path": str(dst), "size_mb": validation.size_mb, "original_filename": file.filename}
 
 
 @app.post("/api/jobs", response_model=JobStatusResponse)
@@ -44,11 +52,17 @@ def create_job(payload: JobCreateRequest, background_tasks: BackgroundTasks) -> 
     if not payload.input_files:
         raise HTTPException(status_code=400, detail="input_files must not be empty")
 
+    safe_inputs: list[str] = []
     for input_file in payload.input_files:
-        if not Path(input_file).exists():
+        path = Path(input_file)
+        if not _is_in_temp_dir(path):
+            raise HTTPException(status_code=400, detail=f"Input file must be within temp storage: {input_file}")
+        resolved = path.resolve(strict=False)
+        if not resolved.exists():
             raise HTTPException(status_code=400, detail=f"Input file not found: {input_file}")
+        safe_inputs.append(str(resolved))
 
-    job = job_store.create(tool=payload.tool.value, input_files=payload.input_files, options=payload.options)
+    job = job_store.create(tool=payload.tool.value, input_files=safe_inputs, options=payload.options)
     background_tasks.add_task(run_job, job)
     return JobStatusResponse(id=job.id, status=job.status, progress=job.progress, eta_seconds=job.eta_seconds)
 
