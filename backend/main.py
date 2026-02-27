@@ -20,6 +20,19 @@ def _is_in_temp_dir(path: Path) -> bool:
     return resolved == temp_root or temp_root in resolved.parents
 
 
+def _resolve_uploaded_input(upload_id: str) -> Path:
+    candidate = Path(upload_id)
+    if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name != upload_id:
+        raise HTTPException(status_code=400, detail=f"Invalid input file reference: {upload_id}")
+
+    resolved = (TEMP_DIR / upload_id).resolve(strict=False)
+    if not _is_in_temp_dir(resolved):
+        raise HTTPException(status_code=400, detail=f"Input file must be within temp storage: {upload_id}")
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=400, detail=f"Input file not found: {upload_id}")
+    return resolved
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
@@ -43,7 +56,12 @@ async def api_upload(file: UploadFile = File(...)) -> dict:
     suffix = Path(file.filename or "upload.bin").suffix
     dst = TEMP_DIR / f"{uuid4().hex}{suffix}"
     dst.write_bytes(content)
-    return {"stored_path": str(dst), "size_mb": validation.size_mb, "original_filename": file.filename}
+    return {
+        "upload_id": dst.name,
+        "stored_path": str(dst),
+        "size_mb": validation.size_mb,
+        "original_filename": file.filename,
+    }
 
 
 @app.post("/api/jobs", response_model=JobStatusResponse)
@@ -54,12 +72,7 @@ def create_job(payload: JobCreateRequest, background_tasks: BackgroundTasks) -> 
 
     safe_inputs: list[str] = []
     for input_file in payload.input_files:
-        path = Path(input_file)
-        if not _is_in_temp_dir(path):
-            raise HTTPException(status_code=400, detail=f"Input file must be within temp storage: {input_file}")
-        resolved = path.resolve(strict=False)
-        if not resolved.exists():
-            raise HTTPException(status_code=400, detail=f"Input file not found: {input_file}")
+        resolved = _resolve_uploaded_input(input_file)
         safe_inputs.append(str(resolved))
 
     job = job_store.create(tool=payload.tool.value, input_files=safe_inputs, options=payload.options)
